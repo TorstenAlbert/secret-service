@@ -15,3 +15,6 @@ data/
 *.db-wal
 *.db-shm
 .env
+docs/*
+SPEC.md
+.claude/*

@@ -7,7 +7,9 @@ from typing import Any
 
 from ss.agents.base import BaseAgent
 from ss.blackboard.models import AgentName, Mission, MissionResult
+from ss.blackboard.repository import Repository
 from ss.pipeline.events import EventType
+from ss.sampling.adapter import SamplingAdapter
 
 
 STEP_EXECUTION_SCHEMA = {
@@ -24,6 +26,27 @@ STEP_EXECUTION_SCHEMA = {
 
 class MissionAgent(BaseAgent):
     """Executes a taktik by simulating each step via LLM."""
+
+    def __init__(
+        self,
+        repo: Repository,
+        sampling: SamplingAdapter,
+        memory_mgr: Any,
+        vector_store: Any,
+        cil: Any = None,
+    ) -> None:
+        """Initialize the MissionAgent.
+
+        Args:
+            repo: Repository for blackboard access.
+            sampling: Sampling adapter for LLM calls.
+            memory_mgr: Memory manager for recall.
+            vector_store: Vector store for embeddings.
+            cil: Optional Code Index Layer for precise locations and session notes.
+                 CIL lowers token cost per call, not the number of calls.
+        """
+        super().__init__(repo, sampling, memory_mgr, vector_store)
+        self._cil = cil
 
     @property
     def name(self) -> AgentName:
@@ -95,6 +118,23 @@ class MissionAgent(BaseAgent):
                 f"Expected outcome: {step.expected_outcome}"
             )
 
+            # Before LLM call: if CIL is set, query for relevant code locations
+            if self._cil is not None:
+                # Derive a key term from the step instruction
+                # (first word longer than 3 chars, or first 40 chars)
+                words = [w for w in step.instruction.split() if len(w) > 3]
+                key_term = words[0] if words else step.instruction[:40]
+
+                # Query CIL for relevant locations
+                locations = self._cil.query(key_term, mode="contains", limit=5)
+
+                # Append locations to the user message if we got hits
+                if locations:
+                    locations_block = "Relevant code locations:\n"
+                    for loc in locations:
+                        locations_block += f"  {loc['name']} ({loc['file']}:{loc['line']})\n"
+                    user_message += f"\n{locations_block}"
+
             step_data = await self.llm_call_structured(
                 system_prompt, user_message, STEP_EXECUTION_SCHEMA
             )
@@ -111,6 +151,12 @@ class MissionAgent(BaseAgent):
                 error_detail=step_data.get("error_detail"),
             )
             self._repo.insert_mission_result(result)
+
+            # After recording the step result: if CIL is set, persist the outcome as a note
+            if self._cil is not None:
+                area = f"mission:{mission.id}"
+                note_text = f"step {step.index}: {result.actual_outcome[:200]}"
+                self._cil.note(area, note_text)
 
             self.emit_event(
                 session_id,

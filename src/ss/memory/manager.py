@@ -1,7 +1,6 @@
 """MemoryManager: store and recall memories with vector similarity."""
 from __future__ import annotations
 
-from typing import Any
 
 from ss.blackboard.models import Memory, MemoryScope, MemoryType
 from ss.blackboard.repository import Repository

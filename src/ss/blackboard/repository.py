@@ -10,7 +10,6 @@ from ss.blackboard.database import Database
 from ss.blackboard.models import (
     AgentName,
     AgentNote,
-    ClientIssueHistory,
     ClientProfile,
     IssueClassification,
     Issue,

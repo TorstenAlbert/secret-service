@@ -5,7 +5,10 @@ from typing import Any
 
 from ss.agents.base import BaseAgent
 from ss.blackboard.models import AgentName, MemoryType, NoteType
+from ss.blackboard.repository import Repository
+from ss.memory.project_memory import ProjectMemory
 from ss.pipeline.events import EventType
+from ss.sampling.adapter import SamplingAdapter
 
 
 VERIFICATION_SCHEMA = {
@@ -22,6 +25,17 @@ VERIFICATION_SCHEMA = {
 
 class JudgeAgent(BaseAgent):
     """Verifies a taktik plan against known failure patterns."""
+
+    def __init__(
+        self,
+        repo: Repository,
+        sampling: SamplingAdapter,
+        memory_mgr: Any,
+        vector_store: Any,
+        pml: ProjectMemory | None = None,
+    ) -> None:
+        super().__init__(repo, sampling, memory_mgr, vector_store)
+        self._pml = pml
 
     @property
     def name(self) -> AgentName:
@@ -90,6 +104,16 @@ class JudgeAgent(BaseAgent):
             f"Required skills: {', '.join(taktik.required_skills)}\n"
             f"Estimated complexity: {taktik.estimated_complexity}"
         ) + bad_ctx
+
+        # Append PML context if available
+        if self._pml is not None:
+            pml_context = self._pml.as_context(["DECISION"])
+            if pml_context:
+                user_message += (
+                    f"\n\n{pml_context}\n\n"
+                    "If the plan violates any project DECISION listed above, "
+                    "set verified=false and name the violated decision in issues_found."
+                )
 
         result = await self.llm_call_structured(
             system_prompt, user_message, VERIFICATION_SCHEMA

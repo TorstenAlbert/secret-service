@@ -16,6 +16,16 @@ from ss.blackboard.models import (
 from ss.pipeline.events import EventType
 
 
+# Master gets only what it needs from the blackboard, not every note: keep the
+# high-signal note types, most-recent first, each truncated.
+_SYNTHESIS_NOTE_TYPES = {
+    NoteType.decision, NoteType.recommendation, NoteType.error_analysis,
+    NoteType.contradiction, NoteType.discovery,
+}
+_MAX_SYNTHESIS_NOTES = 20
+_MAX_NOTE_CHARS = 300
+
+
 CLIENT_ASSESSMENT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -45,6 +55,11 @@ SYNTHESIS_SCHEMA = {
 
 class MasterAgent(BaseAgent):
     """The Master orchestrates session flow and synthesizes outcomes."""
+
+    def __init__(self, repo, sampling, memory_mgr, vector_store, pml=None, cil=None):
+        super().__init__(repo, sampling, memory_mgr, vector_store)
+        self._pml = pml
+        self._cil = cil
 
     @property
     def name(self) -> AgentName:
@@ -137,8 +152,9 @@ class MasterAgent(BaseAgent):
     ) -> dict:
         """Gather notes, synthesize final answer, emit MASTER_SYNTHESIZED."""
         notes = self._repo.list_agent_notes(session_id)
+        relevant = [n for n in notes if n.note_type in _SYNTHESIS_NOTE_TYPES][-_MAX_SYNTHESIS_NOTES:]
         notes_text = "\n".join(
-            f"[{n.agent_name} / {n.note_type}]: {n.content}" for n in notes
+            f"[{n.agent_name}/{n.note_type}]: {n.content[:_MAX_NOTE_CHARS]}" for n in relevant
         )
 
         system_prompt = (
@@ -259,3 +275,100 @@ class MasterAgent(BaseAgent):
                 expires_at=now + timedelta(hours=1),
             )
         )
+
+    async def extract_cross_session_learnings(
+        self,
+        session_id: str,
+        *,
+        winning_strategy: Any,
+        failed_strategies: list,
+        winning_skills: list[str],
+    ) -> None:
+        """Compare winning vs failed branches; write permanent cross-session memories."""
+        if winning_strategy is not None:
+            desc = getattr(winning_strategy, "description", str(winning_strategy))
+            sid = getattr(winning_strategy, "id", "")
+            self._memory_mgr.store(Memory(
+                id=str(uuid.uuid4()),
+                type=MemoryType.pattern,
+                scope=MemoryScope.permanent,
+                source_session_id=session_id,
+                source_agent=self.name,
+                content=f"Winning approach: {desc}",
+                structured_content={"strategy_id": sid, "skills": winning_skills},
+                confidence=1.0,
+            ))
+
+        for failed in failed_strategies:
+            desc = getattr(failed, "description", str(failed))
+            sid = getattr(failed, "id", "")
+            self._memory_mgr.store(Memory(
+                id=str(uuid.uuid4()),
+                type=MemoryType.anti_pattern,
+                scope=MemoryScope.permanent,
+                source_session_id=session_id,
+                source_agent=self.name,
+                content=f"Failed approach (avoid): {desc}",
+                structured_content={"strategy_id": sid},
+                confidence=1.0,
+            ))
+
+        if winning_skills:
+            self._memory_mgr.store(Memory(
+                id=str(uuid.uuid4()),
+                type=MemoryType.knowledge,
+                scope=MemoryScope.long_term,
+                source_session_id=session_id,
+                source_agent=self.name,
+                content=f"Reliable skills for this problem class: {', '.join(winning_skills)}",
+                structured_content={"skills": winning_skills},
+                confidence=1.0,
+            ))
+
+    async def write_project_memory(
+        self,
+        session_id: str,
+        *,
+        winning_strategy: Any,
+        failed_strategies: list | None = None,
+        why: str = "",
+        timeline_entry: str = "",
+        open_tasks: list[str] | None = None,
+    ) -> None:
+        """Write PML decisions/why/timeline and CIL follow-up tasks.
+
+        No-op (never raises) when both pml and cil are None.
+        """
+        if self._pml is not None:
+            # Capture a DECISION for each failed strategy
+            for failed in (failed_strategies or []):
+                desc = getattr(failed, "description", str(failed))
+                sid = getattr(failed, "id", "")
+                label = f"{sid}: {desc}" if sid else desc
+                self._pml.capture_decision(f"Strategy failed: {label}")
+
+            # Capture a DECISION for the winner
+            if winning_strategy is not None:
+                desc = getattr(winning_strategy, "description", str(winning_strategy))
+                sid = getattr(winning_strategy, "id", "")
+                label = f"{sid}: {desc}" if sid else desc
+                self._pml.capture_decision(f"Winning approach: {label}")
+
+            # Capture why only when provided
+            if why:
+                self._pml.capture_why(why)
+
+            # Capture timeline — use provided entry or generate a default
+            if timeline_entry:
+                self._pml.capture_timeline(timeline_entry)
+            else:
+                winner_desc = (
+                    getattr(winning_strategy, "description", str(winning_strategy))
+                    if winning_strategy is not None
+                    else "none"
+                )
+                self._pml.capture_timeline(f"Session {session_id}: winner={winner_desc}")
+
+        if self._cil is not None:
+            for title in (open_tasks or []):
+                self._cil.task("open", title=title, priority="medium")

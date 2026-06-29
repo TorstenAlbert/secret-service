@@ -7,6 +7,10 @@ import re
 from typing import Any
 
 
+class EmptyModelResponse(RuntimeError):
+    """Raised when the model returns an empty response after one retry."""
+
+
 class SamplingAdapter:
     """Wraps MCP context sampling with a semaphore for concurrency control.
 
@@ -31,14 +35,27 @@ class SamplingAdapter:
     ) -> str:
         """Acquire the semaphore and perform a sampling call.
 
-        Returns the raw text response.
+        Returns the raw text response. If the model returns an empty or
+        whitespace-only response, retries once. If the retry is also empty,
+        raises ``EmptyModelResponse``.
         """
         async with self._semaphore:
-            return await self._do_sample(
+            text = await self._do_sample(
                 system_prompt=system_prompt,
                 messages=messages,
                 temperature=temperature,
             )
+            if not text or not text.strip():
+                text = await self._do_sample(
+                    system_prompt=system_prompt,
+                    messages=messages,
+                    temperature=temperature,
+                )
+                if not text or not text.strip():
+                    raise EmptyModelResponse(
+                        "Model returned an empty response after one retry."
+                    )
+            return text
 
     async def complete_structured(
         self,

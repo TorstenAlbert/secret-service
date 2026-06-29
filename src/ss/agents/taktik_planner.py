@@ -7,6 +7,7 @@ from typing import Any
 from ss.agents.base import BaseAgent
 from ss.blackboard.models import AgentName, MemoryType, Taktik, TaktikStep
 from ss.pipeline.events import EventType
+from ss.skills.resolver import ResolvedSkill
 
 
 TAKTIK_SCHEMA = {
@@ -36,6 +37,28 @@ TAKTIK_SCHEMA = {
 
 class TaktikPlannerAgent(BaseAgent):
     """Creates a concrete execution plan (taktik) for a given strategy."""
+
+    def __init__(self, repo, sampling, memory_mgr, vector_store, skill_resolver=None, cil=None, pml=None) -> None:
+        super().__init__(repo, sampling, memory_mgr, vector_store)
+        self._skill_resolver = skill_resolver
+        self._cil = cil
+        self._pml = pml
+
+    @staticmethod
+    def _format_skills_context(resolved: list[ResolvedSkill]) -> str:
+        if not resolved:
+            return ""
+        lines = "\n".join(
+            f"- {r.skill.name} ({r.skill.source}): {r.skill.description}"
+            for r in resolved
+        )
+        return (
+            "\n\n## AVAILABLE SKILLS (discovered via the `npx skills` CLI)\n"
+            "Use these named, installable skills in your plan where applicable "
+            "(install with `npx skills add <source>`). Do NOT re-implement what "
+            "these already provide.\n"
+            f"{lines}\n"
+        )
 
     @property
     def name(self) -> AgentName:
@@ -92,6 +115,35 @@ class TaktikPlannerAgent(BaseAgent):
                 "Please address this issue in your new plan."
             )
 
+        # Step 0: find-skills pre-pass (best-effort)
+        skills_ctx = ""
+        if self._skill_resolver is not None:
+            resolved_skills = await self._skill_resolver.resolve(strategy)
+            skills_ctx = self._format_skills_context(resolved_skills)
+
+        # Step 1: CIL grounding (code structure context)
+        # CIL lowers token cost per call, not the number of calls (that is the loop budget's job).
+        cil_ctx = ""
+        if self._cil is not None:
+            cil_summary = self._cil.summary_text()
+            # Cap signatures so the planning prompt stays cheap even on a large
+            # index (signatures("") spans the whole tree); CIL's value is fewer
+            # tokens per call, so we include only a bounded structural sample.
+            cil_sigs = self._cil.signatures("")[:20]
+            cil_ctx = f"\n\n## CODE STRUCTURE (from index)\n{cil_summary}\n"
+            if cil_sigs:
+                cil_ctx += "Key signatures:\n" + "\n".join(
+                    f"- {s.get('signature') or s.get('name')} ({s.get('file')}:{s.get('line')})"
+                    for s in cil_sigs
+                ) + "\n"
+
+        # Step 2: PML decision constraints
+        pml_ctx = ""
+        if self._pml is not None:
+            pml_decisions = self._pml.as_context(["DECISION"])
+            if pml_decisions:
+                pml_ctx = f"\n\n## PROJECT DECISIONS — your plan MUST NOT violate these\n{pml_decisions}"
+
         system_prompt = (
             "Create a detailed, concrete step-by-step execution plan for the given "
             "software engineering strategy. Include all required skills and estimate "
@@ -102,7 +154,7 @@ class TaktikPlannerAgent(BaseAgent):
             f"Objective: {strategy.objective}\n"
             f"Approach type: {strategy.approach_type}\n"
             f"Attempt #{attempt}"
-        ) + memory_ctx + rejection_ctx
+        ) + cil_ctx + pml_ctx + skills_ctx + memory_ctx + rejection_ctx
 
         data = await self.llm_call_structured(system_prompt, user_message, TAKTIK_SCHEMA)
 

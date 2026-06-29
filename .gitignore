@@ -18,3 +18,5 @@ data/
 docs/*
 SPEC.md
 .claude/*
+tests/*
+CLAUDE.md

@@ -2,21 +2,28 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from ss.agents.council.council import LLMCouncil
 from ss.agents.jury import JuryAgent
 from ss.agents.master import MasterAgent
 from ss.agents.reception import ReceptionAgent
-from ss.agents.strategist import StrategistAgent
 from ss.blackboard.models import Session, SessionStatus
 from ss.blackboard.repository import Repository
 from ss.config import Config
+from ss.intel.code_index import CodeIndex
+from ss.loop.branch_loop import BranchLoop, BranchResult
 from ss.memory.cleanup import MemoryCleanup
 from ss.memory.client_profile import ClientProfileManager
 from ss.memory.manager import MemoryManager
-from ss.pipeline.branch import StrategyBranch, StrategyExhausted
+from ss.memory.project_memory import ProjectMemory
 from ss.pipeline.events import EventType, create_event
+from ss.skills.finder import SkillFinder
+from ss.skills.resolver import SkillResolver
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
@@ -35,21 +42,111 @@ class SessionRunner:
         repo: Repository,
         vector_store: Any,
         memory_mgr: MemoryManager,
-        sampling: Any,
+        bundle: Any,
         config: Config,
     ) -> None:
         self._repo = repo
         self._vector_store = vector_store
         self._memory_mgr = memory_mgr
-        self._sampling = sampling
+        self._bundle = bundle
         self._config = config
         self._cleanup = MemoryCleanup(repo, config)
         self._profile_mgr = ClientProfileManager(repo)
         self._running: dict[str, asyncio.Task] = {}
+        self._skill_resolver = SkillResolver(SkillFinder(config))
+
+        self._pml = None
+        if config.pml_enabled:
+            try:
+                self._pml = ProjectMemory(config.pml_dir)
+            except Exception as exc:
+                logger.warning("PML init failed — continuing without project memory: %s", exc)
+
+        self._cil = None
+        if config.cil_enabled:
+            try:
+                self._cil = CodeIndex(
+                    config.cil_index_root,
+                    config.cil_dir,
+                    encoder=vector_store.encoder,
+                    log_file=config.cil_log_file,
+                )
+            except Exception as exc:
+                logger.warning("CIL init failed — continuing without code index: %s", exc)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def llm_available(self) -> bool:
+        """Whether an LLM provider is available (delegates to the adapter bundle)."""
+        return self._bundle.llm_available
+
+    def bind_context(self, mcp_context: Any) -> None:
+        """Attach a live MCP context to the bundle for the sampling fallback."""
+        self._bundle.bind_context(mcp_context)
+
+    async def solve(
+        self,
+        problem: str,
+        context: dict[str, Any] | None = None,
+        client_id: str = "default",
+        wait: bool = True,
+        timeout: float | None = -1.0,
+    ) -> dict:
+        """Start the pipeline; block until done (default) or return immediately.
+
+        Args:
+            problem: The problem text to solve.
+            context: Optional context dict passed to agents.
+            client_id: Client identifier for session grouping.
+            wait: When False, return the session_id immediately without blocking.
+            timeout: Controls the soft-timeout when ``wait=True``.
+
+                - ``-1.0`` (default) — use ``config.solve_wait_timeout``.
+                - ``None`` — await pipeline to *completion* (no timeout); the call
+                  only returns once the pipeline finishes or raises.
+                - positive float — use this value as the soft-timeout in seconds.
+
+        With a finite timeout, if the soft timeout elapses, returns a poll-me
+        response while the pipeline keeps running (shielded). With ``wait=False``,
+        returns the session id at once.
+        """
+        # Resolve effective timeout
+        if timeout == -1.0:
+            effective_timeout: float | None = self._config.solve_wait_timeout
+        else:
+            effective_timeout = timeout  # None or explicit float
+
+        session_id = await self.start(problem, context, client_id)
+        if not wait:
+            return {"session_id": session_id, "status": "started"}
+        task = self._running.get(session_id)
+        if task is None:
+            return await self.get_result(session_id)
+
+        try:
+            if effective_timeout is None:
+                # Run to completion — no soft timeout
+                await task
+            else:
+                await asyncio.wait_for(
+                    asyncio.shield(task), timeout=effective_timeout
+                )
+        except asyncio.TimeoutError:
+            return {
+                "session_id": session_id,
+                "status": "running",
+                "message": (
+                    f"Still running after {effective_timeout:.0f}s; "
+                    f"call get_result with session_id '{session_id}' to retrieve the answer."
+                ),
+            }
+        except Exception:
+            # Pipeline raised; _run_pipeline already recorded SESSION_FAILED.
+            return await self.get_result(session_id)
+        return await self.get_result(session_id)
 
     async def start(
         self,
@@ -214,85 +311,71 @@ class SessionRunner:
             # Phase 1: Intake
             # ----------------------------------------------------------
             reception = ReceptionAgent(
-                self._repo, self._sampling, self._memory_mgr, self._vector_store
+                self._repo, self._bundle.for_agent("reception"), self._memory_mgr, self._vector_store,
+                pml=self._pml,
             )
-            issue = await reception.execute(
-                session_id, problem=problem, context=context
-            )
+            issue = await reception.execute(session_id, problem=problem, context=context)
 
             master = MasterAgent(
-                self._repo, self._sampling, self._memory_mgr, self._vector_store
+                self._repo, self._bundle.for_agent("master"), self._memory_mgr, self._vector_store,
+                pml=self._pml, cil=self._cil,
             )
-            await master.execute(
-                session_id,
-                issue_summary=issue.summary,
-                client_id=client_id,
-            )
+            await master.execute(session_id, issue_summary=issue.summary, client_id=client_id)
 
-            strategist = StrategistAgent(
-                self._repo, self._sampling, self._memory_mgr, self._vector_store
+            council = LLMCouncil(
+                self._repo, self._bundle, self._memory_mgr, self._vector_store, self._config,
+                pml=self._pml,
             )
-
-            strategies = await strategist.execute(
-                session_id,
-                issue=issue,
-                num_strategies=self._config.num_strategies,
+            strategies = await council.execute(
+                session_id, issue=issue, num_strategies=self._config.num_strategies
             )
 
             # ----------------------------------------------------------
             # Restrategize loop
             # ----------------------------------------------------------
             jury = JuryAgent(
-                self._repo, self._sampling, self._memory_mgr, self._vector_store,
-                self._config,
+                self._repo, self._bundle.for_agent("jury"), self._memory_mgr,
+                self._vector_store, self._config,
             )
 
             succeeded_missions = []
+            all_branch_results: list[BranchResult] = []
             failure_context: str | None = None
 
             for restrategize_round in range(self._config.max_restrategize_rounds + 1):
                 if restrategize_round > 0:
-                    # All branches failed — ask strategist to re-evaluate
-                    strategies = await strategist.execute(
-                        session_id,
-                        issue=issue,
-                        num_strategies=self._config.num_strategies,
+                    strategies = await council.execute(
+                        session_id, issue=issue, num_strategies=self._config.num_strategies,
                         failure_context=failure_context,
                     )
 
-                # --------------------------------------------------
-                # Phase 2: Parallel strategy branches
-                # --------------------------------------------------
-                branch = StrategyBranch(
-                    self._repo,
-                    self._sampling,
-                    self._memory_mgr,
-                    self._vector_store,
-                    self._config,
+                branch = BranchLoop(
+                    self._repo, self._bundle, self._memory_mgr, self._vector_store,
+                    self._config, skill_resolver=self._skill_resolver,
+                    pml=self._pml, cil=self._cil,
                 )
-
-                branch_results = await asyncio.gather(
+                results = await asyncio.gather(
                     *[branch.run(session_id, s) for s in strategies],
                     return_exceptions=True,
                 )
 
+                all_branch_results = []
                 succeeded_missions = []
                 failed_reasons = []
-                for result in branch_results:
-                    if isinstance(result, Exception):
-                        reason = str(result)
-                        failed_reasons.append(reason)
+                for r in results:
+                    if isinstance(r, Exception):
+                        failed_reasons.append(str(r))
+                        continue
+                    all_branch_results.append(r)
+                    if r.status == "succeeded" and r.mission is not None:
+                        succeeded_missions.append(r.mission)
                     else:
-                        succeeded_missions.append(result)
+                        failed_reasons.append(r.reason)
 
                 if succeeded_missions:
-                    break  # At least one branch succeeded
-
-                # Build failure context for re-strategizing
+                    break
                 failure_context = "; ".join(failed_reasons)
-
                 if restrategize_round >= self._config.max_restrategize_rounds:
-                    # All rounds exhausted
                     break
 
             # ----------------------------------------------------------
@@ -346,6 +429,36 @@ class SessionRunner:
                     mission=mission_for_strategy,
                     strategy=strategy,
                     score=score.weighted_total,
+                )
+
+            # Cross-session learning (permanent patterns/anti-patterns)
+            winning_skills: list[str] = []
+            if winning_strategy is not None:
+                wr = next((r for r in all_branch_results
+                           if r.mission is not None and r.strategy_id == winning_strategy.id), None)
+                if wr is not None:
+                    winning_skills = wr.required_skills
+            failed_strategies = [
+                self._repo.get_strategy(r.strategy_id)
+                for r in all_branch_results if r.status == "failed"
+            ]
+            failed_strategies = [s for s in failed_strategies if s is not None]
+            await master.extract_cross_session_learnings(
+                session_id,
+                winning_strategy=winning_strategy,
+                failed_strategies=failed_strategies,
+                winning_skills=winning_skills,
+            )
+
+            # Write project memory (PML decisions/timeline, CIL tasks)
+            if self._pml is not None or self._cil is not None:
+                await master.write_project_memory(
+                    session_id,
+                    winning_strategy=winning_strategy,
+                    failed_strategies=failed_strategies,
+                    why="",
+                    timeline_entry="",
+                    open_tasks=[],
                 )
 
             # ----------------------------------------------------------

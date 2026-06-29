@@ -38,6 +38,19 @@ ISSUE_SCHEMA = {
 class ReceptionAgent(BaseAgent):
     """Receives a problem statement, extracts structured issue information."""
 
+    def __init__(self, repo, sampling, memory_mgr, vector_store, pml=None):
+        """Initialize ReceptionAgent with optional ProjectMemory Layer (PML).
+
+        Args:
+            repo: The repository for database access.
+            sampling: The sampling adapter for LLM calls.
+            memory_mgr: The memory manager for recall.
+            vector_store: The vector store for indexing.
+            pml: Optional ProjectMemory instance for grounding with STATE/HEALTH context.
+        """
+        super().__init__(repo, sampling, memory_mgr, vector_store)
+        self._pml = pml
+
     @property
     def name(self) -> AgentName:
         return AgentName.reception
@@ -92,6 +105,12 @@ class ReceptionAgent(BaseAgent):
             user_message += f"\n\nAdditional context:\n{context}"
         if memory_context:
             user_message += memory_context
+
+        # Prepend project state/health context if PML is available
+        if self._pml is not None:
+            pml_context = self._pml.as_context(["STATE", "HEALTH"])
+            if pml_context:
+                user_message = f"{pml_context}\n\n{user_message}"
 
         data = await self.llm_call_structured(system_prompt, user_message, ISSUE_SCHEMA)
 

@@ -38,6 +38,11 @@ class VectorStore:
     # Public API
     # ------------------------------------------------------------------
 
+    @property
+    def encoder(self) -> EmbeddingEncoder:
+        """The embedding encoder backing this store."""
+        return self._encoder
+
     def index(self, entity_type: str, entity_id: str, text: str) -> None:
         """Embed text and insert/update in vss table + embedding_registry.
 
